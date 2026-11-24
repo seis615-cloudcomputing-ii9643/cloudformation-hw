@@ -1,0 +1,299 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cafe application network with public and private subnets and a bastion host.
+
+Parameters:
+  # Restricts SSH access to the bastion host.
+  WorkstationIP:
+    Description: Public IP address allowed to SSH into the bastion host
+    Type: String
+    Default: 68.190.159.105/32
+
+  # Uses the existing EC2 key pair.
+  KeyName:
+    Description: Existing EC2 key pair name
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafeB
+
+  # Uses the latest Amazon Linux 2023 image for the bastion.
+  BastionAMI:
+    Description: Amazon Linux 2023 AMI
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # Dedicated VPC for the CloudFormation cafe infrastructure.
+  CafeVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.1.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-igw
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref CafeVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet in Availability Zone A.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      CidrBlock: 10.1.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-public-a
+
+  # Public subnet in Availability Zone B.
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      CidrBlock: 10.1.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-public-b
+
+  # Private application subnet in Availability Zone A.
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      CidrBlock: 10.1.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-private-a
+
+  # Private application subnet in Availability Zone B.
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CafeVPC
+      CidrBlock: 10.1.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-private-b
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CafeVPC
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway provides internet access for private instances.
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-nat-eip
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-nat
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CafeVPC
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-private-rt
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Bastion permits SSH only from the workstation IP.
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from workstation only
+      VpcId: !Ref CafeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref WorkstationIP
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-bastion-sg
+
+  # Application servers accept HTTP from the load balancer and SSH from the bastion.
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cafe application server security group
+      VpcId: !Ref CafeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-app-sg
+
+  # Public HTTP access is allowed to the load balancer only.
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow public HTTP traffic to the load balancer
+      VpcId: !Ref CafeVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-alb-sg
+
+  # Bastion host is deployed in the first public subnet.
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BastionAMI
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-bastion
+
+  # Elastic IP provides a persistent public address for the bastion.
+  BastionElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+
+  BastionElasticIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt BastionElasticIP.AllocationId
+      InstanceId: !Ref BastionHost
+
+Outputs:
+  # Exports VPC and subnet IDs for the application stack.
+  VPCID:
+    Description: Cafe VPC ID
+    Value: !Ref CafeVPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  PublicSubnetA:
+    Description: First public subnet
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetA'
+
+  PublicSubnetB:
+    Description: Second public subnet
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnetB'
+
+  PrivateSubnetA:
+    Description: First private application subnet
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetA'
+
+  PrivateSubnetB:
+    Description: Second private application subnet
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetB'
+
+  ApplicationSecurityGroup:
+    Description: Application server security group
+    Value: !Ref ApplicationSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationSecurityGroup'
+
+  LoadBalancerSecurityGroup:
+    Description: Load balancer security group
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerSecurityGroup'
+
+  BastionSecurityGroup:
+    Description: Bastion security group
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-BastionSecurityGroup'
+
+  BastionPublicIP:
+    Description: Bastion host Elastic IP address
+    Value: !Ref BastionElasticIP

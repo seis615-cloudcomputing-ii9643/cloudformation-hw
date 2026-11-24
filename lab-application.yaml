@@ -1,0 +1,182 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cafe application with an Application Load Balancer and Auto Scaling Group.
+
+Parameters:
+  # Network stack name makes this template reusable.
+  NetworkStackName:
+    Description: Name of the deployed network CloudFormation stack
+    Type: String
+    Default: lab-network
+
+  # Uses the cafe application AMI provided for the assignment.
+  CafeAMI:
+    Description: AMI containing the cafe application
+    Type: AWS::EC2::Image::Id
+    Default: ami-076a684c23550bd1f
+
+  # Uses the existing EC2 key pair.
+  KeyName:
+    Description: Existing EC2 key pair name
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: cafeB
+
+  # Makes the Auto Scaling minimum capacity configurable.
+  MinimumCapacity:
+    Description: Minimum number of application instances
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  # Makes the Auto Scaling maximum capacity configurable.
+  MaximumCapacity:
+    Description: Maximum number of application instances
+    Type: Number
+    Default: 4
+    MinValue: 2
+
+  # Specifies the EC2 instance profile used by the cafe application.
+  InstanceProfileName:
+    Description: Existing EC2 instance profile with cafe application permissions
+    Type: String
+    Default: cafe-app-role
+
+  # Identifies the existing cafe database.
+  DatabaseIdentifier:
+    Description: Existing cafe database identifier
+    Type: String
+    Default: caferds
+
+Resources:
+  # Target group checks the cafe application path.
+  CafeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cafe-cfn-targets
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: '${NetworkStackName}-VPCID'
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /cafe/
+      Matcher:
+        HttpCode: 200-399
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-targets
+
+  # Internet-facing ALB uses both public subnets.
+  CafeLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cafe-cfn-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkStackName}-PublicSubnetA'
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkStackName}-PublicSubnetB'
+      SecurityGroups:
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkStackName}-LoadBalancerSecurityGroup'
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-alb
+
+  # Launch template uses the cafe AMI and private application security group.
+  CafeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: cafe-cfn-launch-template
+      LaunchTemplateData:
+        ImageId: !Ref CafeAMI
+        InstanceType: t3.micro
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups:
+              - Fn::ImportValue:
+                  Fn::Sub: '${NetworkStackName}-ApplicationSecurityGroup'
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: cafe-cfn-app-instance
+
+  # ASG runs instances in both private subnets.
+  CafeAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: cafe-cfn-asg
+      MinSize: !Ref MinimumCapacity
+      MaxSize: !Ref MaximumCapacity
+      DesiredCapacity: !Ref MinimumCapacity
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkStackName}-PrivateSubnetA'
+        - Fn::ImportValue:
+            Fn::Sub: '${NetworkStackName}-PrivateSubnetB'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref CafeLaunchTemplate
+        Version: !GetAtt CafeLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref CafeTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: cafe-cfn-app-instance
+          PropagateAtLaunch: true
+
+  # CPU target tracking automatically adjusts ASG capacity.
+  CafeScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref CafeAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+        DisableScaleIn: false
+
+  # ALB forwards HTTP traffic to the cafe application instances.
+  CafeHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref CafeLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref CafeTargetGroup
+
+Outputs:
+  # Provides the cafe website URL for browser testing.
+  CafeWebsiteURL:
+    Description: Cafe application load balancer URL
+    Value: !Sub 'http://${CafeLoadBalancer.DNSName}/cafe/'
+
+  LoadBalancerDNS:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt CafeLoadBalancer.DNSName
+
+  AutoScalingGroupName:
+    Description: Cafe application Auto Scaling Group
+    Value: !Ref CafeAutoScalingGroup
+
+  TargetGroupARN:
+    Description: Cafe application target group ARN
+    Value: !Ref CafeTargetGroup
+
+  DatabaseIdentifier:
+    Description: Existing database identifier supplied for this deployment
+    Value: !Ref DatabaseIdentifier
